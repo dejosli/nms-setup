@@ -5,24 +5,28 @@ CONFIG_FILE="/etc/setup_script.conf"
 if [ ! -f "$CONFIG_FILE" ] && [[ $EUID -eq 0 ]]; then
     echo "Creating default config file at $CONFIG_FILE..."
     cat > "$CONFIG_FILE" <<EOF
-# Dry run mode (0 = execute, 1 = simulate)
+# Dry run mode (0 = execute commands, 1 = simulate without changes)
 DRY_RUN=0
-# Minimum disk space required in MB
+# Minimum disk space required in MB (setup aborts if below this)
 MIN_DISK_SPACE_MB=1000
-# Node.js version to install
+# Node.js version to install (e.g., 18, 20)
 NODE_VERSION=18
-# Service user (must not be root)
+# Service user to run NMS (must not be root)
 SERVICE_USER=mediauser
 # Cleanup previous user data (0 = no, 1 = yes with prompt or --force)
 CLEANUP_PREVIOUS=1
-# Log file location for NMS
+# Log file location for NMS output
 NMS_LOG_FILE=/var/log/nms.log
-# Start the service immediately (0 = configure only, 1 = start)
+# Start the service immediately (0 = configure only, 1 = start after setup)
 START_SERVICE=1
-# Health check URL for NMS (default HTTP port)
+# Health check URL for NMS (HTTP endpoint to verify service)
 HEALTH_CHECK_URL=http://localhost:8000/api/server
-# Ports for NMS (space-separated: RTMP, HTTP, etc.)
+# Ports for NMS (space-separated: RTMP, HTTP, etc., e.g., "1935 8000")
 NMS_PORTS="1935 8000"
+# URL or local path to NMS app.js (default fetches from GitHub)
+NMS_APP_URL=https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
+# Version of node-media-server package to install via npm (e.g., 2.7.0, latest)
+NMS_VERSION=2.7.0
 EOF
     chmod 644 "$CONFIG_FILE" 2>/dev/null || echo "Warning: Could not set config file permissions"
 fi
@@ -37,16 +41,21 @@ CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}
 NMS_LOG_FILE=${NMS_LOG_FILE:-/var/log/nms.log}
 START_SERVICE=${START_SERVICE:-1}
 HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://localhost:8000/api/server}
-NMS_PORTS=${NMS_PORTS:-"1935 8000"}  # Default RTMP (1935) and HTTP (8000)
+NMS_PORTS=${NMS_PORTS:-"1935 8000"}
+NMS_APP_URL=${NMS_APP_URL:-"https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js"}
+NMS_VERSION=${NMS_VERSION:-"2.7.0"}
 
 # Check for command-line flags
 FORCE_CLEANUP=0
 QUIET=0
+NO_ROLLBACK=0
 for arg in "$@"; do
     if [[ "$arg" == "--force" ]]; then
         FORCE_CLEANUP=1
     elif [[ "$arg" == "--quiet" ]]; then
         QUIET=1
+    elif [[ "$arg" == "--no-rollback" ]]; then
+        NO_ROLLBACK=1
     fi
 done
 
@@ -135,7 +144,7 @@ esac
 
 [[ $QUIET -eq 0 ]] && echo "Starting system setup on $DISTRO at $(date)"
 
-# Total steps for progress tracking (increased for firewall step)
+# Total steps for progress tracking
 TOTAL_STEPS=18
 CURRENT_STEP=0
 
@@ -146,15 +155,18 @@ update_progress() {
     [[ $QUIET -eq 0 ]] && echo "Progress: $percent% ($CURRENT_STEP/$TOTAL_STEPS steps completed)"
 }
 
-# Function to run commands with dry-run support
+# Function to run commands with dry-run support and detailed error logging
 run_command() {
     if [[ $DRY_RUN -eq 1 ]]; then
         [[ $QUIET -eq 0 ]] && echo "[DRY-RUN] Command: $@"
     else
         [[ $QUIET -eq 0 ]] && echo "Executing: $@"
-        if ! "$@"; then
+        OUTPUT=$(eval "$@" 2>&1)
+        if [[ $? -ne 0 ]]; then
             echo "Error: Command failed: $@" >&2
-            ERRORS+=("Command failed: $@")
+            echo "Output: $OUTPUT" >&2
+            ERRORS+=("Command failed: $@ - Output: $OUTPUT")
+            [[ $NO_ROLLBACK -eq 0 ]] && rollback
             exit 1
         fi
     fi
@@ -177,7 +189,7 @@ set_selinux_context() {
 # Function to configure firewall
 configure_firewall() {
     [[ $QUIET -eq 0 ]] && echo "Configuring firewall for NMS ports: $NMS_PORTS..."
-    if command -v ufw >/dev/null 2>&1; then  # Debian/Ubuntu
+    if command -v ufw >/dev/null 2>&1; then
         if ufw status | grep -q "Status: active"; then
             for port in $NMS_PORTS; do
                 run_command ufw allow "$port/tcp"
@@ -186,7 +198,7 @@ configure_firewall() {
         else
             [[ $QUIET -eq 0 ]] && echo "UFW installed but not active. Skipping firewall config."
         fi
-    elif command -v firewall-cmd >/dev/null 2>&1; then  # Fedora/CentOS/RHEL
+    elif command -v firewall-cmd >/dev/null 2>&1; then
         if systemctl is-active firewalld >/dev/null 2>&1; then
             for port in $NMS_PORTS; do
                 run_command firewall-cmd --permanent --add-port="$port/tcp"
@@ -202,12 +214,11 @@ configure_firewall() {
         else
             [[ $QUIET -eq 0 ]] && echo "Firewalld installed but not active. Skipping firewall config."
         fi
-    elif command -v iptables >/dev/null 2>&1; then  # Fallback (Arch, generic)
+    elif command -v iptables >/dev/null 2>&1; then
         if iptables -L -n | grep -q "ACCEPT"; then
             for port in $NMS_PORTS; do
                 run_command iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
             done
-            # Persist iptables (distro-specific, manual step recommended)
             [[ $QUIET -eq 0 ]] && echo "Note: iptables rules applied but not persisted. Save manually if needed."
         else
             [[ $QUIET -eq 0 ]] && echo "iptables detected but not configured. Skipping firewall config."
@@ -215,6 +226,20 @@ configure_firewall() {
     else
         echo "Warning: No firewall tool detected (ufw, firewalld, iptables). Skipping firewall config."
         ERRORS+=("No firewall tool detected")
+    fi
+}
+
+# Function to check port conflicts
+check_port_conflicts() {
+    [[ $QUIET -eq 0 ]] && echo "Checking for port conflicts..."
+    if command -v netstat >/dev/null 2>&1; then
+        for port in $NMS_PORTS; do
+            if netstat -tuln | grep -q ":$port"; then
+                echo "Error: Port $port is already in use."
+                ERRORS+=("Port conflict on $port")
+                exit 1
+            fi
+        done
     fi
 }
 
@@ -312,13 +337,17 @@ verify_logrotate() {
 
 # Function to rollback on failure
 rollback() {
-    echo "Rolling back changes due to setup failure..."
-    run_command systemctl stop nms.service 2>/dev/null
-    run_command systemctl disable nms.service 2>/dev/null
-    run_command rm -f /etc/systemd/system/nms.service
-    run_command rm -f /etc/logrotate.d/nms
-    run_command systemctl daemon-reload
-    echo "Rollback completed. Check logs at $LOG_FILE for details."
+    if [[ $NO_ROLLBACK -eq 1 ]]; then
+        echo "Rollback skipped due to --no-rollback flag."
+    else
+        echo "Rolling back changes due to setup failure..."
+        run_command systemctl stop nms.service 2>/dev/null
+        run_command systemctl disable nms.service 2>/dev/null
+        run_command rm -f /etc/systemd/system/nms.service
+        run_command rm -f /etc/logrotate.d/nms
+        run_command systemctl daemon-reload
+        echo "Rollback completed. Check logs at $LOG_FILE for details."
+    fi
 }
 
 # Validate SERVICE_USER
@@ -444,11 +473,11 @@ update_progress
 if [[ -d /sys/block/zram0 || -f /etc/default/zramswap || -f /etc/zram-generator.conf ]]; then
     [[ $QUIET -eq 0 ]] && echo "Configuring ZRAM swap..."
     ZRAM_CONF=""
-    if [ -f /etc/default/zramswap ]; then  # Debian/Ubuntu
+    if [ -f /etc/default/zramswap ]; then
         ZRAM_CONF="/etc/default/zramswap"
         echo -e "ALGO=zstd\nPERCENT=50" > "$ZRAM_CONF"
         run_command systemctl restart zramswap 2>/dev/null || echo "Warning: zramswap service not found"
-    elif [ -f /etc/zram-generator.conf ]; then  # Fedora/Arch
+    elif [ -f /etc/zram-generator.conf ]; then
         ZRAM_CONF="/etc/zram-generator.conf"
         echo -e "[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd" > "$ZRAM_CONF"
         run_command systemctl restart systemd-zram-setup@zram0 2>/dev/null || echo "Warning: zram service not found"
@@ -489,6 +518,7 @@ if ! user_exists "$SERVICE_USER"; then
 fi
 chmod 700 "/home/$SERVICE_USER" 2>/dev/null
 set_selinux_context "/home/$SERVICE_USER" user_home_dir_t
+update_progress
 
 # Backup existing NVM setup if it exists
 [[ $QUIET -eq 0 ]] && echo "Checking for existing NVM setup for $SERVICE_USER..."
@@ -504,21 +534,27 @@ fi
 
 # Install NVM, Node.js, and Yarn for SERVICE_USER
 [[ $QUIET -eq 0 ]] && echo "Installing NVM for $SERVICE_USER..."
-if [ -d "$NVM_DIR" ]; then
+if [ ! -d "$NVM_DIR" ]; then
     check_disk_space 500
     sudo -u "$SERVICE_USER" bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
 sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION"
 sudo -u "$SERVICE_USER" bash -c 'source ~/.nvm/nvm.sh && corepack enable yarn'
 NODE_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && node -v")
+NPM_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && npm -v")
 [[ $QUIET -eq 0 ]] && echo "Installed Node.js version: $NODE_VER"
+[[ $QUIET -eq 0 ]] && echo "Installed npm version: $NPM_VER"
+if [[ "$NODE_VER" < "v18" || "$NPM_VER" < "8" ]]; then
+    echo "Warning: Node.js ($NODE_VER) or npm ($NPM_VER) version may be too old for NMS."
+    ERRORS+=("Node.js/npm version potentially incompatible")
+fi
 chmod -R 700 "$NVM_DIR" 2>/dev/null
 chown -R "$SERVICE_USER:$SERVICE_USER" "$NVM_DIR" 2>/dev/null
 set_selinux_context "$NVM_DIR" user_home_t
 update_progress
 
 # Install Node Media Server
-[[ $QUIET -eq 0 ]] && echo "Setting up Node Media Server for $SERVICE_USER..."
+[[ $QUIET -eq 0 ]] && echo "Setting up Node Media Server for $SERVICE_USER (version: $NMS_VERSION)..."
 check_disk_space "$MIN_DISK_SPACE_MB"
 NMS_DIR="/home/$SERVICE_USER/Node-Media-Server"
 sudo -u "$SERVICE_USER" mkdir -p "$NMS_DIR"
@@ -526,8 +562,12 @@ chmod 700 "$NMS_DIR" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_DIR" 2>/dev/null
 set_selinux_context "$NMS_DIR" user_home_t
 cd "$NMS_DIR"
-sudo -u "$SERVICE_USER" npm i node-media-server@2.7.0
-run_command wget -qO "$NMS_DIR/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
+sudo -u "$SERVICE_USER" npm i "node-media-server@$NMS_VERSION"
+if [[ "$NMS_APP_URL" =~ ^http ]]; then
+    run_command wget -qO "$NMS_DIR/app.js" "$NMS_APP_URL"
+else
+    run_command cp "$NMS_APP_URL" "$NMS_DIR/app.js"
+fi
 chmod 644 "$NMS_DIR/app.js" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_DIR/app.js" 2>/dev/null
 set_selinux_context "$NMS_DIR/app.js" user_home_t
@@ -569,8 +609,16 @@ EOF
     set_selinux_context "$NMS_SERVICE" systemd_unit_file_t
     run_command systemctl daemon-reload
     run_command systemctl enable nms.service
+    check_port_conflicts
     if [[ $START_SERVICE -eq 1 ]]; then
         run_command systemctl start nms.service
+    elif [[ $QUIET -eq 0 ]]; then
+        read -p "Start NMS service now? (y/N): " start_now
+        if [[ "$start_now" =~ ^[Yy]$ ]]; then
+            run_command systemctl start nms.service
+        else
+            [[ $QUIET -eq 0 ]] && echo "Service configured but not started."
+        fi
     else
         [[ $QUIET -eq 0 ]] && echo "Service configured but not started (START_SERVICE=0)"
     fi
@@ -616,7 +664,7 @@ update_progress
 
 # Post-setup validation
 [[ $QUIET -eq 0 ]] && echo "Validating Node Media Server setup..."
-if [[ $DRY_RUN -eq 0 && $START_SERVICE -eq 1 && -f "$NMS_SERVICE" ]]; then
+if [[ $DRY_RUN -eq 0 && -f "$NMS_SERVICE" && ($START_SERVICE -eq 1 || "$start_now" =~ ^[Yy]$) ]]; then
     sleep 2
     if systemctl is-active nms.service >/dev/null 2>&1; then
         if command -v netstat >/dev/null 2>&1; then
@@ -696,11 +744,23 @@ update_progress
 [[ $QUIET -eq 0 ]] && echo "Setup complete!"
 [[ $QUIET -eq 0 ]] && echo "System status:"
 [[ $QUIET -eq 0 ]] && echo "Node.js version: $NODE_VER"
+[[ $QUIET -eq 0 ]] && echo "npm version: $NPM_VER"
 [[ $QUIET -eq 0 ]] && echo "Service user: $SERVICE_USER"
+[[ $QUIET -eq 0 ]] && echo "NMS version: $NMS_VERSION"
 [[ $QUIET -eq 0 ]] && echo "NMS log file: $NMS_LOG_FILE"
 [[ $QUIET -eq 0 ]] && echo "NMS ports: $NMS_PORTS"
 [[ $QUIET -eq 0 ]] && echo "Disk space: $(df -h / | tail -1)"
 [[ $QUIET -eq 0 ]] && echo "Memory: $(free -h | grep Mem:)"
+[[ $QUIET -eq 0 ]] && echo "Firewall status:"
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    [[ $QUIET -eq 0 ]] && ufw status | grep -E "$(echo $NMS_PORTS | tr ' ' '|')"
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    [[ $QUIET -eq 0 ]] && firewall-cmd --list-ports
+elif command -v iptables >/dev/null 2>&1; then
+    [[ $QUIET -eq 0 ]] && iptables -L -n | grep -E "$(echo $NMS_PORTS | tr ' ' '|')"
+else
+    [[ $QUIET -eq 0 ]] && echo "No active firewall detected."
+fi
 if [[ ${#ERRORS[@]} -gt 0 ]]; then
     echo "Errors encountered during setup:"
     for err in "${ERRORS[@]}"; do
