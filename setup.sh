@@ -9,6 +9,7 @@ DRY_RUN=${DRY_RUN:-0}
 MIN_DISK_SPACE_MB=${MIN_DISK_SPACE_MB:-1000}
 NODE_VERSION=${NODE_VERSION:-18}
 SERVICE_USER=${SERVICE_USER:-administrator}
+CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}  # 0 = no cleanup, 1 = cleanup previous user data
 
 # Ensure the script runs with root privileges
 if [[ $EUID -ne 0 ]]; then
@@ -61,6 +62,52 @@ check_disk_space() {
     fi
     echo "Disk space check passed: ${available_mb}MB available"
 }
+
+# Function to validate username
+validate_username() {
+    local username=$1
+    if [[ -z "$username" || ! "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        echo "Error: Invalid username '$username'. Must start with a letter or underscore, followed by letters, numbers, underscores, or hyphens."
+        exit 1
+    fi
+    echo "Username '$username' is valid"
+}
+
+# Function to cleanup previous user data
+cleanup_previous_user() {
+    local old_user=$1
+    if user_exists "$old_user" && [[ "$old_user" != "$SERVICE_USER" ]]; then
+        echo "Cleaning up previous user data for '$old_user'..."
+        run_command systemctl disable nms.service 2>/dev/null
+        run_command rm -f /etc/systemd/system/nms.service
+        run_command rm -f /etc/logrotate.d/nms
+        run_command rm -rf "/home/$old_user/Node-Media-Server"
+        run_command rm -rf "/home/$old_user/.nvm"
+        run_command userdel -r "$old_user" 2>/dev/null
+    fi
+}
+
+# Function to verify log rotation
+verify_logrotate() {
+    echo "Verifying log rotation configuration..."
+    if [[ $DRY_RUN -eq 0 ]]; then
+        run_command logrotate -d /etc/logrotate.d/nms 2>&1 | grep -v "log does not exist"
+        if [[ $? -eq 0 ]]; then
+            echo "Log rotation configuration verified successfully"
+        else
+            echo "Warning: Log rotation configuration may have issues"
+        fi
+    fi
+}
+
+# Validate SERVICE_USER
+validate_username "$SERVICE_USER"
+
+# Check for previous user cleanup
+if [[ $CLEANUP_PREVIOUS -eq 1 && -f /etc/systemd/system/nms.service ]]; then
+    OLD_USER=$(grep "^User=" /etc/systemd/system/nms.service | cut -d= -f2)
+    cleanup_previous_user "$OLD_USER"
+fi
 
 # Check initial disk space
 check_disk_space "$MIN_DISK_SPACE_MB"
@@ -231,6 +278,9 @@ cat > $LOGROTATE_CONF <<EOF
 }
 EOF
 
+# Verify log rotation configuration
+verify_logrotate
+
 # Final Checks and System Optimization
 echo "Final system checks..."
 run_command systemctl status nms.service --no-pager
@@ -258,6 +308,7 @@ run_command systemctl disable bluetooth.service --now 2>/dev/null
 echo "Setup complete!"
 echo "System status:"
 echo "Node.js version: $NODE_VER"
+echo "Service user: $SERVICE_USER"
 echo "Disk space: $(df -h / | tail -1)"
 echo "Memory: $(free -h | grep Mem:)"
 
