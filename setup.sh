@@ -79,6 +79,10 @@ validate_username() {
         echo "Error: Invalid username '$username'. Must start with a letter or underscore, followed by letters, numbers, underscores, or hyphens."
         exit 1
     fi
+    if [[ "$username" == "root" ]]; then
+        echo "Error: SERVICE_USER cannot be 'root'. Node.js and service components must run as a non-root user."
+        exit 1
+    fi
     echo "Username '$username' is valid"
 }
 
@@ -257,7 +261,7 @@ if ! user_exists "$SERVICE_USER"; then
     run_command passwd "$SERVICE_USER"
 fi
 
-# Install NVM, Node.js, and Yarn
+# Install NVM, Node.js, and Yarn for SERVICE_USER (never root)
 echo "Installing NVM for $SERVICE_USER..."
 if [ ! -d "/home/$SERVICE_USER/.nvm" ]; then
     check_disk_space 500
@@ -270,7 +274,7 @@ NODE_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && node -v")
 echo "Installed Node.js version: $NODE_VER"
 
 # Install Node Media Server
-echo "Setting up Node Media Server..."
+echo "Setting up Node Media Server for $SERVICE_USER..."
 check_disk_space "$MIN_DISK_SPACE_MB"
 sudo -u "$SERVICE_USER" mkdir -p "/home/$SERVICE_USER/Node-Media-Server"
 cd "/home/$SERVICE_USER/Node-Media-Server"
