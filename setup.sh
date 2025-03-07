@@ -1,7 +1,13 @@
 #!/bin/bash
 
-# Dry-run mode (set to 1 to enable)
-DRY_RUN=0
+# Configuration file (optional)
+CONFIG_FILE="/etc/setup_script.conf"
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+# Default configurations (can be overridden in config file)
+DRY_RUN=${DRY_RUN:-0}
+MIN_DISK_SPACE_MB=${MIN_DISK_SPACE_MB:-1000}
+NODE_VERSION=${NODE_VERSION:-18}
 
 # Ensure the script runs with root privileges
 if [[ $EUID -ne 0 ]]; then
@@ -13,7 +19,7 @@ fi
 LOG_FILE="/var/log/setup_script.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "Starting system setup..."
+echo "Starting system setup at $(date)"
 
 # Function to run commands with dry-run support
 run_command() {
@@ -44,9 +50,30 @@ is_ssd() {
     fi
 }
 
-# Configure APT sources list (Backup and Replace)
+# Function to check disk space
+check_disk_space() {
+    local required_mb=$1
+    local available_mb=$(df -BM / | tail -1 | awk '{print $4}' | sed 's/M//')
+    if [[ $available_mb -lt $required_mb ]]; then
+        echo "Error: Insufficient disk space. Required: ${required_mb}MB, Available: ${available_mb}MB"
+        exit 1
+    fi
+    echo "Disk space check passed: ${available_mb}MB available"
+}
+
+# Check initial disk space
+check_disk_space "$MIN_DISK_SPACE_MB"
+
+# Configure APT sources list
 echo "Configuring APT sources list..."
-run_command cp /etc/apt/sources.list /etc/apt/sources.list.bak
+if [[ -f /etc/apt/sources.list ]]; then
+    run_command cp /etc/apt/sources.list /etc/apt/sources.list.bak
+    # Verify backup
+    if [[ ! -f /etc/apt/sources.list.bak && $DRY_RUN -eq 0 ]]; then
+        echo "Error: Backup of sources.list failed"
+        exit 1
+    fi
+fi
 
 cat > /etc/apt/sources.list <<EOF
 deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
@@ -60,26 +87,26 @@ if [ -d "/etc/apt/sources.list.d" ]; then
     find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sed -i 's/^deb/#deb/g' {} +
 fi
 
-# Update and Upgrade with Retry (in case of network failures)
+# Update and Upgrade with Retry
 echo "Updating and upgrading system..."
 for i in {1..3}; do
     run_command apt update && run_command apt upgrade -y && break || sleep 10
 done
 
-# Remove unnecessary packages and clean up
+# Clean up
 echo "Cleaning up the system..."
 run_command apt autoremove -y
 run_command apt autoclean -y
 
-# Install Required Packages
+# Install Required Packages with version checking
 REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-tools" "ffmpeg")
-
 for PKG in "${REQUIRED_PKGS[@]}"; do
     if ! command -v $PKG &> /dev/null; then
         echo "Installing missing package: $PKG..."
         run_command apt install -y $PKG
     else
-        echo "$PKG is already installed."
+        VERSION=$(dpkg -l | grep "^ii\s*$PKG" | awk '{print $3}')
+        echo "$PKG is already installed (version: $VERSION)"
     fi
 done
 
@@ -89,6 +116,8 @@ run_command mkdir -p /var/log/journal
 run_command systemctl restart systemd-journald
 
 JOURNAL_CONF="/etc/systemd/journald.conf"
+[ ! -f "$JOURNAL_CONF" ] && echo "Error: journald.conf not found" && exit 1
+
 sed -i '/^#Storage=/c\Storage=persistent' $JOURNAL_CONF
 sed -i '/^#SystemMaxUse=/c\SystemMaxUse=200M' $JOURNAL_CONF
 sed -i '/^#SystemMaxFileSize=/c\SystemMaxFileSize=50M' $JOURNAL_CONF
@@ -128,25 +157,29 @@ sed -i '/^#FallbackDNS=/c\FallbackDNS=9.9.9.9' $RESOLVED_CONF
 run_command systemctl restart systemd-resolved
 run_command systemd-resolve --status | grep 'DNS Servers'
 
-# Install NVM, Node.js, and Yarn (Only if not already installed)
-echo "Installing NVM..."
+# Create administrator user if it doesn't exist
 if ! user_exists "administrator"; then
-    echo "Error: User 'administrator' does not exist. Please create the user and rerun the script."
-    exit 1
+    echo "Creating administrator user..."
+    run_command useradd -m -s /bin/bash administrator
+    echo "Please set a password for the administrator user:"
+    run_command passwd administrator
 fi
 
+# Install NVM, Node.js, and Yarn
+echo "Installing NVM..."
 if [ ! -d "/home/administrator/.nvm" ]; then
-    echo "Installing NVM for administrator..."
+    check_disk_space 500
     sudo -u administrator bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
 
-sudo -u administrator bash -c 'source ~/.nvm/nvm.sh && nvm install 18'
-sudo -u administrator bash -c 'source ~/.nvm/nvm.sh && node -v'
-sudo -u administrator bash -c 'source ~/.nvm/nvm.sh && npm -v'
-sudo -u administrator bash -c 'corepack enable yarn && yarn -v'
+sudo -u administrator bash -c "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION"
+sudo -u administrator bash -c 'source ~/.nvm/nvm.sh && corepack enable yarn'
+NODE_VER=$(sudo -u administrator bash -c "source ~/.nvm/nvm.sh && node -v")
+echo "Installed Node.js version: $NODE_VER"
 
 # Install Node Media Server
 echo "Setting up Node Media Server..."
+check_disk_space "$MIN_DISK_SPACE_MB"
 sudo -u administrator mkdir -p /home/administrator/Node-Media-Server
 cd /home/administrator/Node-Media-Server
 sudo -u administrator npm i node-media-server@2.7.0
@@ -222,6 +255,10 @@ echo "Disabling unused services..."
 run_command systemctl disable bluetooth.service --now 2>/dev/null
 
 echo "Setup complete!"
+echo "System status:"
+echo "Node.js version: $NODE_VER"
+echo "Disk space: $(df -h / | tail -1)"
+echo "Memory: $(free -h | grep Mem:)"
 
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] Script completed in dry-run mode. No changes were made."
