@@ -21,6 +21,8 @@ NMS_LOG_FILE=/var/log/nms.log
 START_SERVICE=1
 # Health check URL for NMS (default HTTP port)
 HEALTH_CHECK_URL=http://localhost:8000/api/server
+# Ports for NMS (space-separated: RTMP, HTTP, etc.)
+NMS_PORTS="1935 8000"
 EOF
     chmod 644 "$CONFIG_FILE" 2>/dev/null || echo "Warning: Could not set config file permissions"
 fi
@@ -35,6 +37,7 @@ CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}
 NMS_LOG_FILE=${NMS_LOG_FILE:-/var/log/nms.log}
 START_SERVICE=${START_SERVICE:-1}
 HEALTH_CHECK_URL=${HEALTH_CHECK_URL:-http://localhost:8000/api/server}
+NMS_PORTS=${NMS_PORTS:-"1935 8000"}  # Default RTMP (1935) and HTTP (8000)
 
 # Check for command-line flags
 FORCE_CLEANUP=0
@@ -73,7 +76,7 @@ else
     DISTRO="unknown"
 fi
 
-# SELinux detection and handling (only for RHEL-based distros or if explicitly enabled)
+# SELinux detection (only for RHEL-based distros or if explicitly enabled)
 SELINUX_ENABLED=0
 case "$DISTRO" in
     centos|rhel|fedora)
@@ -97,7 +100,7 @@ case "$DISTRO" in
         PKG_UPGRADE="$PKG_MANAGER upgrade -y"
         PKG_INSTALL="$PKG_MANAGER install -y"
         PKG_CLEAN="$PKG_MANAGER autoremove -y && $PKG_MANAGER autoclean"
-        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-tools" "ffmpeg" "net-tools")
+        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-tools" "ffmpeg" "net-tools" "ufw")
         ;;
     fedora)
         PKG_MANAGER="dnf"
@@ -105,7 +108,7 @@ case "$DISTRO" in
         PKG_UPGRADE="$PKG_MANAGER upgrade -y"
         PKG_INSTALL="$PKG_MANAGER install -y"
         PKG_CLEAN="$PKG_MANAGER autoremove -y"
-        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools")
+        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools" "firewalld")
         ;;
     centos|rhel)
         PKG_MANAGER="yum"
@@ -113,7 +116,7 @@ case "$DISTRO" in
         PKG_UPGRADE="$PKG_MANAGER upgrade -y"
         PKG_INSTALL="$PKG_MANAGER install -y"
         PKG_CLEAN="$PKG_MANAGER autoremove -y"
-        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools")
+        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools" "firewalld")
         ;;
     arch)
         PKG_MANAGER="pacman"
@@ -121,7 +124,7 @@ case "$DISTRO" in
         PKG_UPGRADE="$PKG_MANAGER -Syu --noconfirm"
         PKG_INSTALL="$PKG_MANAGER -S --noconfirm"
         PKG_CLEAN="$PKG_MANAGER -Rns \$(pacman -Qdtq) --noconfirm"
-        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools")
+        REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-generator" "ffmpeg" "net-tools" "iptables")
         ;;
     *)
         echo "Unsupported distro: $DISTRO. Attempting generic setup."
@@ -132,8 +135,8 @@ esac
 
 [[ $QUIET -eq 0 ]] && echo "Starting system setup on $DISTRO at $(date)"
 
-# Total steps for progress tracking
-TOTAL_STEPS=17
+# Total steps for progress tracking (increased for firewall step)
+TOTAL_STEPS=18
 CURRENT_STEP=0
 
 # Function to update progress
@@ -168,6 +171,50 @@ set_selinux_context() {
         if command -v restorecon >/dev/null 2>&1; then
             restorecon "$file" 2>/dev/null
         fi
+    fi
+}
+
+# Function to configure firewall
+configure_firewall() {
+    [[ $QUIET -eq 0 ]] && echo "Configuring firewall for NMS ports: $NMS_PORTS..."
+    if command -v ufw >/dev/null 2>&1; then  # Debian/Ubuntu
+        if ufw status | grep -q "Status: active"; then
+            for port in $NMS_PORTS; do
+                run_command ufw allow "$port/tcp"
+            done
+            run_command ufw reload
+        else
+            [[ $QUIET -eq 0 ]] && echo "UFW installed but not active. Skipping firewall config."
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1; then  # Fedora/CentOS/RHEL
+        if systemctl is-active firewalld >/dev/null 2>&1; then
+            for port in $NMS_PORTS; do
+                run_command firewall-cmd --permanent --add-port="$port/tcp"
+            done
+            run_command firewall-cmd --reload
+            if [[ $SELINUX_ENABLED -eq 1 ]]; then
+                for port in $NMS_PORTS; do
+                    if command -v semanage >/dev/null 2>&1; then
+                        semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null || echo "Warning: SELinux port $port already defined or semanage failed"
+                    fi
+                done
+            fi
+        else
+            [[ $QUIET -eq 0 ]] && echo "Firewalld installed but not active. Skipping firewall config."
+        fi
+    elif command -v iptables >/dev/null 2>&1; then  # Fallback (Arch, generic)
+        if iptables -L -n | grep -q "ACCEPT"; then
+            for port in $NMS_PORTS; do
+                run_command iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+            done
+            # Persist iptables (distro-specific, manual step recommended)
+            [[ $QUIET -eq 0 ]] && echo "Note: iptables rules applied but not persisted. Save manually if needed."
+        else
+            [[ $QUIET -eq 0 ]] && echo "iptables detected but not configured. Skipping firewall config."
+        fi
+    else
+        echo "Warning: No firewall tool detected (ufw, firewalld, iptables). Skipping firewall config."
+        ERRORS+=("No firewall tool detected")
     fi
 }
 
@@ -319,23 +366,19 @@ EOF
             chmod 644 /etc/apt/sources.list 2>/dev/null
             ;;
         fedora)
-            # Enable RPM Fusion for ffmpeg
             if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
                 run_command "$PKG_INSTALL https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"
             fi
             ;;
         centos|rhel)
-            # Enable EPEL for additional packages
             if ! rpm -q epel-release >/dev/null 2>&1; then
                 run_command "$PKG_INSTALL epel-release"
             fi
-            # Enable CRB (PowerTools) for ffmpeg on CentOS
             if [[ "$DISTRO" == "centos" ]]; then
                 run_command "$PKG_MANAGER config-manager --set-enabled crb"
             fi
             ;;
         arch)
-            # Arch uses default mirrorlist; ensure multilib for some packages
             if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
                 echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
                 chmod 644 /etc/pacman.conf 2>/dev/null
@@ -461,7 +504,7 @@ fi
 
 # Install NVM, Node.js, and Yarn for SERVICE_USER
 [[ $QUIET -eq 0 ]] && echo "Installing NVM for $SERVICE_USER..."
-if [ ! -d "$NVM_DIR" ]; then
+if [ -d "$NVM_DIR" ]; then
     check_disk_space 500
     sudo -u "$SERVICE_USER" bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
@@ -488,6 +531,7 @@ run_command wget -qO "$NMS_DIR/app.js" https://raw.githubusercontent.com/dejosli
 chmod 644 "$NMS_DIR/app.js" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_DIR/app.js" 2>/dev/null
 set_selinux_context "$NMS_DIR/app.js" user_home_t
+update_progress
 
 # Check for existing NMS service
 [[ $QUIET -eq 0 ]] && echo "Checking for existing NMS service..."
@@ -566,17 +610,29 @@ else
 fi
 update_progress
 
+# Configure firewall
+configure_firewall
+update_progress
+
 # Post-setup validation
 [[ $QUIET -eq 0 ]] && echo "Validating Node Media Server setup..."
 if [[ $DRY_RUN -eq 0 && $START_SERVICE -eq 1 && -f "$NMS_SERVICE" ]]; then
     sleep 2
     if systemctl is-active nms.service >/dev/null 2>&1; then
         if command -v netstat >/dev/null 2>&1; then
-            if netstat -tuln | grep -q ":1935"; then
-                [[ $QUIET -eq 0 ]] && echo "Validation: Node Media Server is running and listening on port 1935"
-            else
-                echo "Warning: Node Media Server is running but not listening on port 1935"
-                ERRORS+=("NMS not listening on port 1935")
+            PORTS_LISTENING=0
+            for port in $NMS_PORTS; do
+                if netstat -tuln | grep -q ":$port"; then
+                    [[ $QUIET -eq 0 ]] && echo "Validation: NMS is listening on port $port"
+                    ((PORTS_LISTENING++))
+                fi
+            done
+            if [[ $PORTS_LISTENING -eq 0 ]]; then
+                echo "Warning: NMS is running but not listening on any configured ports ($NMS_PORTS)"
+                ERRORS+=("NMS not listening on any ports")
+            elif [[ $PORTS_LISTENING -lt $(echo "$NMS_PORTS" | wc -w) ]]; then
+                echo "Warning: NMS is running but not listening on all configured ports ($NMS_PORTS)"
+                ERRORS+=("NMS missing some ports")
             fi
         fi
         if command -v curl >/dev/null 2>&1; then
@@ -642,6 +698,7 @@ update_progress
 [[ $QUIET -eq 0 ]] && echo "Node.js version: $NODE_VER"
 [[ $QUIET -eq 0 ]] && echo "Service user: $SERVICE_USER"
 [[ $QUIET -eq 0 ]] && echo "NMS log file: $NMS_LOG_FILE"
+[[ $QUIET -eq 0 ]] && echo "NMS ports: $NMS_PORTS"
 [[ $QUIET -eq 0 ]] && echo "Disk space: $(df -h / | tail -1)"
 [[ $QUIET -eq 0 ]] && echo "Memory: $(free -h | grep Mem:)"
 if [[ ${#ERRORS[@]} -gt 0 ]]; then
