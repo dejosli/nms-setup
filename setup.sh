@@ -10,6 +10,8 @@ MIN_DISK_SPACE_MB=${MIN_DISK_SPACE_MB:-1000}
 NODE_VERSION=${NODE_VERSION:-18}
 SERVICE_USER=${SERVICE_USER:-administrator}
 CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}
+NMS_LOG_FILE=${NMS_LOG_FILE:-/var/log/nms.log}
+START_SERVICE=${START_SERVICE:-1}  # 1 = start service, 0 = configure only
 
 # Check for --force flag
 FORCE_CLEANUP=0
@@ -29,6 +31,7 @@ fi
 # Setup logging
 LOG_FILE="/var/log/setup_script.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
+ERRORS=()
 
 echo "Starting system setup at $(date)"
 
@@ -38,9 +41,9 @@ run_command() {
         echo "[DRY-RUN] Command: $@"
     else
         echo "Executing: $@"
-        "$@"
-        if [[ $? -ne 0 ]]; then
-            echo "Error: Command failed: $@"
+        if ! "$@"; then
+            echo "Error: Command failed: $@" >&2
+            ERRORS+=("Command failed: $@")
             exit 1
         fi
     fi
@@ -67,6 +70,7 @@ check_disk_space() {
     local available_mb=$(df -BM / | tail -1 | awk '{print $4}' | sed 's/M//')
     if [[ $available_mb -lt $required_mb ]]; then
         echo "Error: Insufficient disk space. Required: ${required_mb}MB, Available: ${available_mb}MB"
+        ERRORS+=("Insufficient disk space")
         exit 1
     fi
     echo "Disk space check passed: ${available_mb}MB available"
@@ -77,10 +81,12 @@ validate_username() {
     local username=$1
     if [[ -z "$username" || ! "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
         echo "Error: Invalid username '$username'. Must start with a letter or underscore, followed by letters, numbers, underscores, or hyphens."
+        ERRORS+=("Invalid username: $username")
         exit 1
     fi
     if [[ "$username" == "root" ]]; then
         echo "Error: SERVICE_USER cannot be 'root'. Node.js and service components must run as a non-root user."
+        ERRORS+=("SERVICE_USER cannot be root")
         exit 1
     fi
     echo "Username '$username' is valid"
@@ -91,6 +97,7 @@ cleanup_previous_user() {
     local old_user=$1
     if [[ "$old_user" == "root" ]]; then
         echo "Error: Attempted to clean up root user. This is not allowed."
+        ERRORS+=("Attempted to clean up root user")
         exit 1
     fi
     if user_exists "$old_user" && [[ "$old_user" != "$SERVICE_USER" ]]; then
@@ -128,6 +135,7 @@ verify_logrotate() {
             echo "Log rotation configuration verified successfully"
         else
             echo "Warning: Log rotation configuration may have issues"
+            ERRORS+=("Log rotation configuration issue")
         fi
     fi
 }
@@ -143,7 +151,6 @@ if [[ $CLEANUP_PREVIOUS -eq 1 ]]; then
     elif [[ -d "/home/$SERVICE_USER/Node-Media-Server" ]]; then
         OLD_USER=$(stat -c '%U' "/home/$SERVICE_USER/Node-Media-Server" 2>/dev/null)
     else
-        # Enhanced detection: Check all home directories for Node-Media-Server
         for dir in /home/*; do
             if [[ -d "$dir/Node-Media-Server" ]]; then
                 OLD_USER=$(basename "$dir")
@@ -167,6 +174,7 @@ if [[ -f /etc/apt/sources.list ]]; then
     run_command cp /etc/apt/sources.list /etc/apt/sources.list.bak
     if [[ ! -f /etc/apt/sources.list.bak && $DRY_RUN -eq 0 ]]; then
         echo "Error: Backup of sources.list failed"
+        ERRORS+=("APT sources list backup failed")
         exit 1
     fi
 fi
@@ -212,7 +220,7 @@ run_command mkdir -p /var/log/journal
 run_command systemctl restart systemd-journald
 
 JOURNAL_CONF="/etc/systemd/journald.conf"
-[ ! -f "$JOURNAL_CONF" ] && echo "Error: journald.conf not found" && exit 1
+[ ! -f "$JOURNAL_CONF" ] && echo "Error: journald.conf not found" && ERRORS+=("journald.conf not found") && exit 1
 
 sed -i '/^#Storage=/c\Storage=persistent' $JOURNAL_CONF
 sed -i '/^#SystemMaxUse=/c\SystemMaxUse=200M' $JOURNAL_CONF
@@ -261,9 +269,18 @@ if ! user_exists "$SERVICE_USER"; then
     run_command passwd "$SERVICE_USER"
 fi
 
-# Install NVM, Node.js, and Yarn for SERVICE_USER (never root)
+# Backup existing NVM setup if it exists
+echo "Checking for existing NVM setup for $SERVICE_USER..."
+NVM_DIR="/home/$SERVICE_USER/.nvm"
+if [ -d "$NVM_DIR" ] && [[ $DRY_RUN -eq 0 ]]; then
+    BACKUP_DIR="/home/$SERVICE_USER/.nvm_backup_$(date +%Y%m%d_%H%M%S)"
+    echo "Backing up existing NVM directory to $BACKUP_DIR..."
+    run_command cp -r "$NVM_DIR" "$BACKUP_DIR"
+fi
+
+# Install NVM, Node.js, and Yarn for SERVICE_USER
 echo "Installing NVM for $SERVICE_USER..."
-if [ ! -d "/home/$SERVICE_USER/.nvm" ]; then
+if [ ! -d "$NVM_DIR" ]; then
     check_disk_space 500
     sudo -u "$SERVICE_USER" bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
@@ -276,45 +293,61 @@ echo "Installed Node.js version: $NODE_VER"
 # Install Node Media Server
 echo "Setting up Node Media Server for $SERVICE_USER..."
 check_disk_space "$MIN_DISK_SPACE_MB"
-sudo -u "$SERVICE_USER" mkdir -p "/home/$SERVICE_USER/Node-Media-Server"
-cd "/home/$SERVICE_USER/Node-Media-Server"
+NMS_DIR="/home/$SERVICE_USER/Node-Media-Server"
+sudo -u "$SERVICE_USER" mkdir -p "$NMS_DIR"
+cd "$NMS_DIR"
 sudo -u "$SERVICE_USER" npm i node-media-server@2.7.0
 
 # Download app.js
 echo "Downloading app.js..."
-run_command wget -qO "/home/$SERVICE_USER/Node-Media-Server/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
+run_command wget -qO "$NMS_DIR/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
+
+# Check for existing NMS service
+echo "Checking for existing NMS service..."
+NMS_SERVICE="/etc/systemd/system/nms.service"
+if [[ -f "$NMS_SERVICE" && $DRY_RUN -eq 0 ]]; then
+    CURRENT_USER=$(grep "^User=" "$NMS_SERVICE" | cut -d= -f2)
+    if [[ "$CURRENT_USER" != "$SERVICE_USER" ]]; then
+        echo "Warning: NMS service exists with user '$CURRENT_USER'. Overwriting with '$SERVICE_USER'."
+        run_command systemctl stop nms.service 2>/dev/null
+    fi
+fi
 
 # Create systemd service for Node Media Server
 echo "Creating systemd service for NMS..."
-NMS_SERVICE="/etc/systemd/system/nms.service"
-cat > $NMS_SERVICE <<EOF
+cat > "$NMS_SERVICE" <<EOF
 [Unit]
 Description=Node Media Server
 After=network.target
 
 [Service]
-ExecStart=/bin/bash -c '. /home/$SERVICE_USER/.nvm/nvm.sh && exec node /home/$SERVICE_USER/Node-Media-Server/app.js'
+ExecStart=/bin/bash -c '. /home/$SERVICE_USER/.nvm/nvm.sh && exec node $NMS_DIR/app.js'
 Restart=always
 RestartSec=5s
 User=$SERVICE_USER
 Group=$SERVICE_USER
-WorkingDirectory=/home/$SERVICE_USER/Node-Media-Server
-StandardOutput=append:/var/log/nms.log
-StandardError=append:/var/log/nms.log
+WorkingDirectory=$NMS_DIR
+StandardOutput=append:$NMS_LOG_FILE
+StandardError=append:$NMS_LOG_FILE
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Reload systemd and enable the service
+# Reload systemd and enable/start the service
 run_command systemctl daemon-reload
-run_command systemctl enable --now nms.service
+run_command systemctl enable nms.service
+if [[ $START_SERVICE -eq 1 ]]; then
+    run_command systemctl start nms.service
+else
+    echo "Service configured but not started (START_SERVICE=0)"
+fi
 
 # Configure logrotate for NMS logs
 echo "Setting up log rotation for NMS logs..."
 LOGROTATE_CONF="/etc/logrotate.d/nms"
-cat > $LOGROTATE_CONF <<EOF
-/var/log/nms.log {
+cat > "$LOGROTATE_CONF" <<EOF
+$NMS_LOG_FILE {
     weekly
     rotate 2
     size 10M
@@ -354,12 +387,20 @@ fi
 echo "Disabling unused services..."
 run_command systemctl disable bluetooth.service --now 2>/dev/null
 
+# Summary
 echo "Setup complete!"
 echo "System status:"
 echo "Node.js version: $NODE_VER"
 echo "Service user: $SERVICE_USER"
+echo "NMS log file: $NMS_LOG_FILE"
 echo "Disk space: $(df -h / | tail -1)"
 echo "Memory: $(free -h | grep Mem:)"
+if [[ ${#ERRORS[@]} -gt 0 ]]; then
+    echo "Errors encountered during setup:"
+    for err in "${ERRORS[@]}"; do
+        echo "- $err"
+    done
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] Script completed in dry-run mode. No changes were made."
