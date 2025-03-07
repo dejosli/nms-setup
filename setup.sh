@@ -2,6 +2,26 @@
 
 # Configuration file (optional)
 CONFIG_FILE="/etc/setup_script.conf"
+if [ ! -f "$CONFIG_FILE" ] && [[ $EUID -eq 0 ]]; then
+    echo "Creating default config file at $CONFIG_FILE..."
+    cat > "$CONFIG_FILE" <<EOF
+# Dry run mode (0 = execute, 1 = simulate)
+DRY_RUN=0
+# Minimum disk space required in MB
+MIN_DISK_SPACE_MB=1000
+# Node.js version to install
+NODE_VERSION=18
+# Service user (must not be root)
+SERVICE_USER=mediauser
+# Cleanup previous user data (0 = no, 1 = yes with prompt or --force)
+CLEANUP_PREVIOUS=1
+# Log file location for NMS
+NMS_LOG_FILE=/var/log/nms.log
+# Start the service immediately (0 = configure only, 1 = start)
+START_SERVICE=1
+EOF
+    chmod 644 "$CONFIG_FILE"
+fi
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 # Default configurations (can be overridden in config file)
@@ -11,7 +31,7 @@ NODE_VERSION=${NODE_VERSION:-18}
 SERVICE_USER=${SERVICE_USER:-administrator}
 CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}
 NMS_LOG_FILE=${NMS_LOG_FILE:-/var/log/nms.log}
-START_SERVICE=${START_SERVICE:-1}  # 1 = start service, 0 = configure only
+START_SERVICE=${START_SERVICE:-1}
 
 # Check for --force flag
 FORCE_CLEANUP=0
@@ -34,6 +54,17 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 ERRORS=()
 
 echo "Starting system setup at $(date)"
+
+# Total steps for progress tracking (approximate)
+TOTAL_STEPS=15
+CURRENT_STEP=0
+
+# Function to update progress
+update_progress() {
+    ((CURRENT_STEP++))
+    local percent=$((CURRENT_STEP * 100 / TOTAL_STEPS))
+    echo "Progress: $percent% ($CURRENT_STEP/$TOTAL_STEPS steps completed)"
+}
 
 # Function to run commands with dry-run support
 run_command() {
@@ -142,6 +173,7 @@ verify_logrotate() {
 
 # Validate SERVICE_USER
 validate_username "$SERVICE_USER"
+update_progress
 
 # Check for previous user cleanup with enhanced detection
 if [[ $CLEANUP_PREVIOUS -eq 1 ]]; then
@@ -164,9 +196,11 @@ if [[ $CLEANUP_PREVIOUS -eq 1 ]]; then
         echo "No previous user data detected for cleanup"
     fi
 fi
+update_progress
 
 # Check initial disk space
 check_disk_space "$MIN_DISK_SPACE_MB"
+update_progress
 
 # Configure APT sources list
 echo "Configuring APT sources list..."
@@ -178,29 +212,32 @@ if [[ -f /etc/apt/sources.list ]]; then
         exit 1
     fi
 fi
-
 cat > /etc/apt/sources.list <<EOF
 deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
 deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
 deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
 EOF
+update_progress
 
 # Disable extra repositories
 if [ -d "/etc/apt/sources.list.d" ]; then
     echo "Disabling additional repositories..."
     find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sed -i 's/^deb/#deb/g' {} +
 fi
+update_progress
 
 # Update and Upgrade with Retry
 echo "Updating and upgrading system..."
 for i in {1..3}; do
     run_command apt update && run_command apt upgrade -y && break || sleep 10
 done
+update_progress
 
 # Clean up
 echo "Cleaning up the system..."
 run_command apt autoremove -y
 run_command apt autoclean -y
+update_progress
 
 # Install Required Packages with version checking
 REQUIRED_PKGS=("curl" "git" "vim" "wget" "logrotate" "zram-tools" "ffmpeg")
@@ -213,15 +250,14 @@ for PKG in "${REQUIRED_PKGS[@]}"; do
         echo "$PKG is already installed (version: $VERSION)"
     fi
 done
+update_progress
 
 # Configure Persistent systemd Journal Logs
 echo "Configuring systemd journaling..."
 run_command mkdir -p /var/log/journal
 run_command systemctl restart systemd-journald
-
 JOURNAL_CONF="/etc/systemd/journald.conf"
 [ ! -f "$JOURNAL_CONF" ] && echo "Error: journald.conf not found" && ERRORS+=("journald.conf not found") && exit 1
-
 sed -i '/^#Storage=/c\Storage=persistent' $JOURNAL_CONF
 sed -i '/^#SystemMaxUse=/c\SystemMaxUse=200M' $JOURNAL_CONF
 sed -i '/^#SystemMaxFileSize=/c\SystemMaxFileSize=50M' $JOURNAL_CONF
@@ -232,9 +268,9 @@ sed -i '/^#SyncIntervalSec=/c\SyncIntervalSec=5m' $JOURNAL_CONF
 sed -i '/^#RateLimitInterval=/c\RateLimitInterval=30s' $JOURNAL_CONF
 sed -i '/^#RateLimitBurst=/c\RateLimitBurst=500' $JOURNAL_CONF
 sed -i '/^#ForwardToSyslog=/c\ForwardToSyslog=no' $JOURNAL_CONF
-
 run_command systemctl restart systemd-journald
 run_command journalctl --disk-usage
+update_progress
 
 # Configure Cron Job for Auto Log Cleanup
 CRON_JOB="0 3 * * 7 root journalctl --vacuum-time=30d"
@@ -242,6 +278,7 @@ if ! crontab -l 2>/dev/null | grep -Fq "$CRON_JOB"; then
     echo "Adding cron job for log cleanup..."
     (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
 fi
+update_progress
 
 # Configure ZRAM Swap
 echo "Configuring ZRAM swap..."
@@ -249,17 +286,17 @@ ZRAM_CONF="/etc/default/zramswap"
 echo -e "ALGO=zstd\nPERCENT=50" > $ZRAM_CONF
 run_command systemctl restart zramswap
 run_command free -h
+update_progress
 
 # Enable systemd-resolved
 echo "Enabling systemd-resolved..."
 run_command systemctl enable systemd-resolved --now
-
-# Configure DNS settings
 RESOLVED_CONF="/etc/systemd/resolved.conf"
 sed -i '/^#DNS=/c\DNS=1.1.1.1 8.8.8.8' $RESOLVED_CONF
 sed -i '/^#FallbackDNS=/c\FallbackDNS=9.9.9.9' $RESOLVED_CONF
 run_command systemctl restart systemd-resolved
 run_command systemd-resolve --status | grep 'DNS Servers'
+update_progress
 
 # Create service user if it doesn't exist
 if ! user_exists "$SERVICE_USER"; then
@@ -284,11 +321,11 @@ if [ ! -d "$NVM_DIR" ]; then
     check_disk_space 500
     sudo -u "$SERVICE_USER" bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
-
 sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION"
 sudo -u "$SERVICE_USER" bash -c 'source ~/.nvm/nvm.sh && corepack enable yarn'
 NODE_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && node -v")
 echo "Installed Node.js version: $NODE_VER"
+update_progress
 
 # Install Node Media Server
 echo "Setting up Node Media Server for $SERVICE_USER..."
@@ -297,9 +334,6 @@ NMS_DIR="/home/$SERVICE_USER/Node-Media-Server"
 sudo -u "$SERVICE_USER" mkdir -p "$NMS_DIR"
 cd "$NMS_DIR"
 sudo -u "$SERVICE_USER" npm i node-media-server@2.7.0
-
-# Download app.js
-echo "Downloading app.js..."
 run_command wget -qO "$NMS_DIR/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
 
 # Check for existing NMS service
@@ -333,8 +367,6 @@ StandardError=append:$NMS_LOG_FILE
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Reload systemd and enable/start the service
 run_command systemctl daemon-reload
 run_command systemctl enable nms.service
 if [[ $START_SERVICE -eq 1 ]]; then
@@ -342,6 +374,7 @@ if [[ $START_SERVICE -eq 1 ]]; then
 else
     echo "Service configured but not started (START_SERVICE=0)"
 fi
+update_progress
 
 # Configure logrotate for NMS logs
 echo "Setting up log rotation for NMS logs..."
@@ -359,9 +392,29 @@ $NMS_LOG_FILE {
     create 640 $SERVICE_USER $SERVICE_USER
 }
 EOF
-
-# Verify log rotation configuration
 verify_logrotate
+update_progress
+
+# Post-setup validation
+echo "Validating Node Media Server setup..."
+if [[ $DRY_RUN -eq 0 && $START_SERVICE -eq 1 ]]; then
+    sleep 2  # Give the service a moment to start
+    if systemctl is-active nms.service >/dev/null 2>&1; then
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -tuln | grep -q ":1935"; then
+                echo "Validation: Node Media Server is running and listening on port 1935"
+            else
+                echo "Warning: Node Media Server is running but not listening on port 1935"
+                ERRORS+=("NMS not listening on port 1935")
+            fi
+        else
+            echo "Note: netstat not installed, skipping port check"
+        fi
+    else
+        echo "Error: Node Media Server service failed to start"
+        ERRORS+=("NMS service failed to start")
+    fi
+fi
 
 # Final Checks and System Optimization
 echo "Final system checks..."
