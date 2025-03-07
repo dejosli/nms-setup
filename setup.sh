@@ -9,7 +9,16 @@ DRY_RUN=${DRY_RUN:-0}
 MIN_DISK_SPACE_MB=${MIN_DISK_SPACE_MB:-1000}
 NODE_VERSION=${NODE_VERSION:-18}
 SERVICE_USER=${SERVICE_USER:-administrator}
-CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}  # 0 = no cleanup, 1 = cleanup previous user data
+CLEANUP_PREVIOUS=${CLEANUP_PREVIOUS:-0}
+
+# Check for --force flag
+FORCE_CLEANUP=0
+for arg in "$@"; do
+    if [[ "$arg" == "--force" ]]; then
+        FORCE_CLEANUP=1
+        break
+    fi
+done
 
 # Ensure the script runs with root privileges
 if [[ $EUID -ne 0 ]]; then
@@ -73,16 +82,25 @@ validate_username() {
     echo "Username '$username' is valid"
 }
 
-# Function to cleanup previous user data with confirmation
+# Function to cleanup previous user data with confirmation and root protection
 cleanup_previous_user() {
     local old_user=$1
+    if [[ "$old_user" == "root" ]]; then
+        echo "Error: Attempted to clean up root user. This is not allowed."
+        exit 1
+    fi
     if user_exists "$old_user" && [[ "$old_user" != "$SERVICE_USER" ]]; then
         echo "WARNING: Previous user '$old_user' detected. Cleanup will remove:"
         echo "- User account and home directory (/home/$old_user)"
         echo "- Node Media Server files and service"
         echo "- Log rotation configuration"
-        read -p "Are you sure you want to proceed with cleanup? (y/N): " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if [[ $FORCE_CLEANUP -eq 1 ]]; then
+            echo "Force cleanup enabled (--force flag detected)"
+            proceed="y"
+        else
+            read -p "Are you sure you want to proceed with cleanup? (y/N): " proceed
+        fi
+        if [[ "$proceed" =~ ^[Yy]$ ]]; then
             echo "Cleaning up previous user data for '$old_user'..."
             run_command systemctl disable nms.service 2>/dev/null
             run_command rm -f /etc/systemd/system/nms.service
@@ -113,10 +131,27 @@ verify_logrotate() {
 # Validate SERVICE_USER
 validate_username "$SERVICE_USER"
 
-# Check for previous user cleanup
-if [[ $CLEANUP_PREVIOUS -eq 1 && -f /etc/systemd/system/nms.service ]]; then
-    OLD_USER=$(grep "^User=" /etc/systemd/system/nms.service | cut -d= -f2)
-    cleanup_previous_user "$OLD_USER"
+# Check for previous user cleanup with enhanced detection
+if [[ $CLEANUP_PREVIOUS -eq 1 ]]; then
+    OLD_USER=""
+    if [[ -f /etc/systemd/system/nms.service ]]; then
+        OLD_USER=$(grep "^User=" /etc/systemd/system/nms.service | cut -d= -f2)
+    elif [[ -d "/home/$SERVICE_USER/Node-Media-Server" ]]; then
+        OLD_USER=$(stat -c '%U' "/home/$SERVICE_USER/Node-Media-Server" 2>/dev/null)
+    else
+        # Enhanced detection: Check all home directories for Node-Media-Server
+        for dir in /home/*; do
+            if [[ -d "$dir/Node-Media-Server" ]]; then
+                OLD_USER=$(basename "$dir")
+                break
+            fi
+        done
+    fi
+    if [[ -n "$OLD_USER" ]]; then
+        cleanup_previous_user "$OLD_USER"
+    else
+        echo "No previous user data detected for cleanup"
+    fi
 fi
 
 # Check initial disk space
