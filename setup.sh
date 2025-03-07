@@ -73,12 +73,22 @@ else
     DISTRO="unknown"
 fi
 
-# SELinux detection and handling
+# SELinux detection and handling (only for RHEL-based distros or if explicitly enabled)
 SELINUX_ENABLED=0
-if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "SELinux status:.*enabled"; then
-    SELINUX_ENABLED=1
-    [[ $QUIET -eq 0 ]] && echo "SELinux detected and enabled. Adjusting contexts accordingly."
-fi
+case "$DISTRO" in
+    centos|rhel|fedora)
+        if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "SELinux status:.*enabled"; then
+            SELINUX_ENABLED=1
+            [[ $QUIET -eq 0 ]] && echo "SELinux detected and enabled on $DISTRO. Adjusting contexts accordingly."
+        fi
+        ;;
+    *)
+        if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "SELinux status:.*enabled"; then
+            SELINUX_ENABLED=1
+            [[ $QUIET -eq 0 ]] && echo "SELinux detected and enabled on $DISTRO (non-standard). Adjusting contexts."
+        fi
+        ;;
+esac
 
 case "$DISTRO" in
     debian|ubuntu)
@@ -133,7 +143,7 @@ update_progress() {
     [[ $QUIET -eq 0 ]] && echo "Progress: $percent% ($CURRENT_STEP/$TOTAL_STEPS steps completed)"
 }
 
-# Function to run commands with dry-run support and SELinux context
+# Function to run commands with dry-run support
 run_command() {
     if [[ $DRY_RUN -eq 1 ]]; then
         [[ $QUIET -eq 0 ]] && echo "[DRY-RUN] Command: $@"
@@ -307,7 +317,6 @@ deb http://security.debian.org/debian-security bookworm-security main contrib no
 deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
 EOF
             chmod 644 /etc/apt/sources.list 2>/dev/null
-            set_selinux_context /etc/apt/sources.list etc_t
             ;;
         fedora)
             # Enable RPM Fusion for ffmpeg
@@ -330,7 +339,6 @@ EOF
             if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
                 echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
                 chmod 644 /etc/pacman.conf 2>/dev/null
-                set_selinux_context /etc/pacman.conf etc_t
             fi
             ;;
     esac
