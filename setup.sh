@@ -73,6 +73,13 @@ else
     DISTRO="unknown"
 fi
 
+# SELinux detection and handling
+SELINUX_ENABLED=0
+if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "SELinux status:.*enabled"; then
+    SELINUX_ENABLED=1
+    [[ $QUIET -eq 0 ]] && echo "SELinux detected and enabled. Adjusting contexts accordingly."
+fi
+
 case "$DISTRO" in
     debian|ubuntu)
         PKG_MANAGER="apt"
@@ -115,7 +122,7 @@ esac
 
 [[ $QUIET -eq 0 ]] && echo "Starting system setup on $DISTRO at $(date)"
 
-# Total steps for progress tracking (adjusted for distro-specific steps)
+# Total steps for progress tracking
 TOTAL_STEPS=17
 CURRENT_STEP=0
 
@@ -126,7 +133,7 @@ update_progress() {
     [[ $QUIET -eq 0 ]] && echo "Progress: $percent% ($CURRENT_STEP/$TOTAL_STEPS steps completed)"
 }
 
-# Function to run commands with dry-run support
+# Function to run commands with dry-run support and SELinux context
 run_command() {
     if [[ $DRY_RUN -eq 1 ]]; then
         [[ $QUIET -eq 0 ]] && echo "[DRY-RUN] Command: $@"
@@ -136,6 +143,20 @@ run_command() {
             echo "Error: Command failed: $@" >&2
             ERRORS+=("Command failed: $@")
             exit 1
+        fi
+    fi
+}
+
+# Function to set SELinux context if applicable
+set_selinux_context() {
+    local file=$1
+    local context=$2
+    if [[ $SELINUX_ENABLED -eq 1 && -f "$file" && -n "$context" ]]; then
+        if command -v chcon >/dev/null 2>&1; then
+            chcon -t "$context" "$file" 2>/dev/null || echo "Warning: Failed to set SELinux context $context on $file"
+        fi
+        if command -v restorecon >/dev/null 2>&1; then
+            restorecon "$file" 2>/dev/null
         fi
     fi
 }
@@ -276,7 +297,7 @@ update_progress
 
 # Configure package sources and update
 if [[ -n "$PKG_MANAGER" ]]; then
-    [[ $QUIET -eq 0 ]] && echo "Updating package sources for $DISTRO..."
+    [[ $QUIET -eq 0 ]] && echo "Configuring package sources for $DISTRO..."
     case "$DISTRO" in
         debian|ubuntu)
             run_command cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || echo "No sources.list to backup"
@@ -286,12 +307,31 @@ deb http://security.debian.org/debian-security bookworm-security main contrib no
 deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
 EOF
             chmod 644 /etc/apt/sources.list 2>/dev/null
+            set_selinux_context /etc/apt/sources.list etc_t
             ;;
-        fedora|centos|rhel)
-            # Assume default repos are sufficient; add custom repos if needed
+        fedora)
+            # Enable RPM Fusion for ffmpeg
+            if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
+                run_command "$PKG_INSTALL https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"
+            fi
+            ;;
+        centos|rhel)
+            # Enable EPEL for additional packages
+            if ! rpm -q epel-release >/dev/null 2>&1; then
+                run_command "$PKG_INSTALL epel-release"
+            fi
+            # Enable CRB (PowerTools) for ffmpeg on CentOS
+            if [[ "$DISTRO" == "centos" ]]; then
+                run_command "$PKG_MANAGER config-manager --set-enabled crb"
+            fi
             ;;
         arch)
-            # Arch uses default mirrorlist
+            # Arch uses default mirrorlist; ensure multilib for some packages
+            if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
+                echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+                chmod 644 /etc/pacman.conf 2>/dev/null
+                set_selinux_context /etc/pacman.conf etc_t
+            fi
             ;;
     esac
     run_command "$PKG_UPDATE"
@@ -309,6 +349,7 @@ if command -v systemctl >/dev/null 2>&1; then
     [[ $QUIET -eq 0 ]] && echo "Configuring systemd journaling..."
     run_command mkdir -p /var/log/journal
     chmod 755 /var/log/journal 2>/dev/null
+    set_selinux_context /var/log/journal var_log_t
     JOURNAL_CONF="/etc/systemd/journald.conf"
     if [ -f "$JOURNAL_CONF" ]; then
         sed -i '/^#Storage=/c\Storage=persistent' $JOURNAL_CONF
@@ -322,6 +363,7 @@ if command -v systemctl >/dev/null 2>&1; then
         sed -i '/^#RateLimitBurst=/c\RateLimitBurst=500' $JOURNAL_CONF
         sed -i '/^#ForwardToSyslog=/c\ForwardToSyslog=no' $JOURNAL_CONF
         chmod 644 "$JOURNAL_CONF" 2>/dev/null
+        set_selinux_context "$JOURNAL_CONF" systemd_unit_file_t
         run_command systemctl restart systemd-journald
         run_command journalctl --disk-usage
     else
@@ -362,6 +404,7 @@ if [[ -d /sys/block/zram0 || -f /etc/default/zramswap || -f /etc/zram-generator.
     fi
     if [[ -n "$ZRAM_CONF" ]]; then
         chmod 644 "$ZRAM_CONF" 2>/dev/null
+        set_selinux_context "$ZRAM_CONF" etc_t
     fi
     run_command free -h
 else
@@ -379,6 +422,7 @@ if command -v systemctl >/dev/null 2>&1; then
         sed -i '/^#DNS=/c\DNS=1.1.1.1 8.8.8.8' "$RESOLVED_CONF"
         sed -i '/^#FallbackDNS=/c\FallbackDNS=9.9.9.9' "$RESOLVED_CONF"
         chmod 644 "$RESOLVED_CONF" 2>/dev/null
+        set_selinux_context "$RESOLVED_CONF" systemd_unit_file_t
         run_command systemctl restart systemd-resolved
         run_command systemd-resolve --status | grep 'DNS Servers' 2>/dev/null
     fi
@@ -393,6 +437,7 @@ if ! user_exists "$SERVICE_USER"; then
     run_command passwd "$SERVICE_USER"
 fi
 chmod 700 "/home/$SERVICE_USER" 2>/dev/null
+set_selinux_context "/home/$SERVICE_USER" user_home_dir_t
 
 # Backup existing NVM setup if it exists
 [[ $QUIET -eq 0 ]] && echo "Checking for existing NVM setup for $SERVICE_USER..."
@@ -403,6 +448,7 @@ if [ -d "$NVM_DIR" ] && [[ $DRY_RUN -eq 0 ]]; then
     run_command cp -r "$NVM_DIR" "$BACKUP_DIR"
     chmod -R 700 "$BACKUP_DIR" 2>/dev/null
     chown -R "$SERVICE_USER:$SERVICE_USER" "$BACKUP_DIR" 2>/dev/null
+    set_selinux_context "$BACKUP_DIR" user_home_t
 fi
 
 # Install NVM, Node.js, and Yarn for SERVICE_USER
@@ -417,6 +463,7 @@ NODE_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && node -v")
 [[ $QUIET -eq 0 ]] && echo "Installed Node.js version: $NODE_VER"
 chmod -R 700 "$NVM_DIR" 2>/dev/null
 chown -R "$SERVICE_USER:$SERVICE_USER" "$NVM_DIR" 2>/dev/null
+set_selinux_context "$NVM_DIR" user_home_t
 update_progress
 
 # Install Node Media Server
@@ -426,11 +473,13 @@ NMS_DIR="/home/$SERVICE_USER/Node-Media-Server"
 sudo -u "$SERVICE_USER" mkdir -p "$NMS_DIR"
 chmod 700 "$NMS_DIR" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_DIR" 2>/dev/null
+set_selinux_context "$NMS_DIR" user_home_t
 cd "$NMS_DIR"
 sudo -u "$SERVICE_USER" npm i node-media-server@2.7.0
 run_command wget -qO "$NMS_DIR/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
 chmod 644 "$NMS_DIR/app.js" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_DIR/app.js" 2>/dev/null
+set_selinux_context "$NMS_DIR/app.js" user_home_t
 
 # Check for existing NMS service
 [[ $QUIET -eq 0 ]] && echo "Checking for existing NMS service..."
@@ -465,6 +514,7 @@ StandardError=append:$NMS_LOG_FILE
 WantedBy=multi-user.target
 EOF
     chmod 644 "$NMS_SERVICE" 2>/dev/null
+    set_selinux_context "$NMS_SERVICE" systemd_unit_file_t
     run_command systemctl daemon-reload
     run_command systemctl enable nms.service
     if [[ $START_SERVICE -eq 1 ]]; then
@@ -479,6 +529,7 @@ fi
 touch "$NMS_LOG_FILE" 2>/dev/null
 chmod 640 "$NMS_LOG_FILE" 2>/dev/null
 chown "$SERVICE_USER:$SERVICE_USER" "$NMS_LOG_FILE" 2>/dev/null
+set_selinux_context "$NMS_LOG_FILE" var_log_t
 update_progress
 
 # Configure logrotate for NMS logs
@@ -499,6 +550,7 @@ $NMS_LOG_FILE {
 }
 EOF
     chmod 644 "$LOGROTATE_CONF" 2>/dev/null
+    set_selinux_context "$LOGROTATE_CONF" etc_t
     verify_logrotate
 else
     echo "Warning: logrotate not available. Skipping log rotation setup."
@@ -555,7 +607,7 @@ if [[ -n "$PKG_MANAGER" ]]; then
             ;;
         fedora|centos|rhel)
             run_command "$PKG_INSTALL dnf-automatic"
-            run_command systemctl enable --now dnf-automatic-install.timer
+            run_command systemctl enable --now dnf-automatic-install.timer 2>/dev/null
             ;;
         arch)
             echo "Note: Arch uses rolling updates. Skipping unattended-upgrades."
