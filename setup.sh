@@ -8,6 +8,7 @@ CONFIG_FILE="/etc/setup_script.conf"
 DRY_RUN=${DRY_RUN:-0}
 MIN_DISK_SPACE_MB=${MIN_DISK_SPACE_MB:-1000}
 NODE_VERSION=${NODE_VERSION:-18}
+SERVICE_USER=${SERVICE_USER:-administrator}
 
 # Ensure the script runs with root privileges
 if [[ $EUID -ne 0 ]]; then
@@ -68,7 +69,6 @@ check_disk_space "$MIN_DISK_SPACE_MB"
 echo "Configuring APT sources list..."
 if [[ -f /etc/apt/sources.list ]]; then
     run_command cp /etc/apt/sources.list /etc/apt/sources.list.bak
-    # Verify backup
     if [[ ! -f /etc/apt/sources.list.bak && $DRY_RUN -eq 0 ]]; then
         echo "Error: Backup of sources.list failed"
         exit 1
@@ -157,36 +157,36 @@ sed -i '/^#FallbackDNS=/c\FallbackDNS=9.9.9.9' $RESOLVED_CONF
 run_command systemctl restart systemd-resolved
 run_command systemd-resolve --status | grep 'DNS Servers'
 
-# Create administrator user if it doesn't exist
-if ! user_exists "administrator"; then
-    echo "Creating administrator user..."
-    run_command useradd -m -s /bin/bash administrator
-    echo "Please set a password for the administrator user:"
-    run_command passwd administrator
+# Create service user if it doesn't exist
+if ! user_exists "$SERVICE_USER"; then
+    echo "Creating service user: $SERVICE_USER..."
+    run_command useradd -m -s /bin/bash "$SERVICE_USER"
+    echo "Please set a password for $SERVICE_USER:"
+    run_command passwd "$SERVICE_USER"
 fi
 
 # Install NVM, Node.js, and Yarn
-echo "Installing NVM..."
-if [ ! -d "/home/administrator/.nvm" ]; then
+echo "Installing NVM for $SERVICE_USER..."
+if [ ! -d "/home/$SERVICE_USER/.nvm" ]; then
     check_disk_space 500
-    sudo -u administrator bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
+    sudo -u "$SERVICE_USER" bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash'
 fi
 
-sudo -u administrator bash -c "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION"
-sudo -u administrator bash -c 'source ~/.nvm/nvm.sh && corepack enable yarn'
-NODE_VER=$(sudo -u administrator bash -c "source ~/.nvm/nvm.sh && node -v")
+sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION"
+sudo -u "$SERVICE_USER" bash -c 'source ~/.nvm/nvm.sh && corepack enable yarn'
+NODE_VER=$(sudo -u "$SERVICE_USER" bash -c "source ~/.nvm/nvm.sh && node -v")
 echo "Installed Node.js version: $NODE_VER"
 
 # Install Node Media Server
 echo "Setting up Node Media Server..."
 check_disk_space "$MIN_DISK_SPACE_MB"
-sudo -u administrator mkdir -p /home/administrator/Node-Media-Server
-cd /home/administrator/Node-Media-Server
-sudo -u administrator npm i node-media-server@2.7.0
+sudo -u "$SERVICE_USER" mkdir -p "/home/$SERVICE_USER/Node-Media-Server"
+cd "/home/$SERVICE_USER/Node-Media-Server"
+sudo -u "$SERVICE_USER" npm i node-media-server@2.7.0
 
 # Download app.js
 echo "Downloading app.js..."
-run_command wget -qO /home/administrator/Node-Media-Server/app.js https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
+run_command wget -qO "/home/$SERVICE_USER/Node-Media-Server/app.js" https://raw.githubusercontent.com/dejosli/boilerplates/refs/heads/main/docker-compose/node-media-server/app.js
 
 # Create systemd service for Node Media Server
 echo "Creating systemd service for NMS..."
@@ -197,12 +197,12 @@ Description=Node Media Server
 After=network.target
 
 [Service]
-ExecStart=/bin/bash -c '. /home/administrator/.nvm/nvm.sh && exec node /home/administrator/Node-Media-Server/app.js'
+ExecStart=/bin/bash -c '. /home/$SERVICE_USER/.nvm/nvm.sh && exec node /home/$SERVICE_USER/Node-Media-Server/app.js'
 Restart=always
 RestartSec=5s
-User=administrator
-Group=administrator
-WorkingDirectory=/home/administrator/Node-Media-Server
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=/home/$SERVICE_USER/Node-Media-Server
 StandardOutput=append:/var/log/nms.log
 StandardError=append:/var/log/nms.log
 
@@ -227,6 +227,7 @@ cat > $LOGROTATE_CONF <<EOF
     delaycompress
     notifempty
     copytruncate
+    create 640 $SERVICE_USER $SERVICE_USER
 }
 EOF
 
