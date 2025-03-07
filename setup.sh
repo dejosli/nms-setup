@@ -73,17 +73,27 @@ validate_username() {
     echo "Username '$username' is valid"
 }
 
-# Function to cleanup previous user data
+# Function to cleanup previous user data with confirmation
 cleanup_previous_user() {
     local old_user=$1
     if user_exists "$old_user" && [[ "$old_user" != "$SERVICE_USER" ]]; then
-        echo "Cleaning up previous user data for '$old_user'..."
-        run_command systemctl disable nms.service 2>/dev/null
-        run_command rm -f /etc/systemd/system/nms.service
-        run_command rm -f /etc/logrotate.d/nms
-        run_command rm -rf "/home/$old_user/Node-Media-Server"
-        run_command rm -rf "/home/$old_user/.nvm"
-        run_command userdel -r "$old_user" 2>/dev/null
+        echo "WARNING: Previous user '$old_user' detected. Cleanup will remove:"
+        echo "- User account and home directory (/home/$old_user)"
+        echo "- Node Media Server files and service"
+        echo "- Log rotation configuration"
+        read -p "Are you sure you want to proceed with cleanup? (y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Cleaning up previous user data for '$old_user'..."
+            run_command systemctl disable nms.service 2>/dev/null
+            run_command rm -f /etc/systemd/system/nms.service
+            run_command rm -f /etc/logrotate.d/nms
+            run_command rm -rf "/home/$old_user/Node-Media-Server"
+            run_command rm -rf "/home/$old_user/.nvm"
+            run_command userdel -r "$old_user" 2>/dev/null
+            echo "Cleanup completed for '$old_user'"
+        else
+            echo "Cleanup aborted. Proceeding with setup using new user '$SERVICE_USER'."
+        fi
     fi
 }
 
