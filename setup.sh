@@ -8,6 +8,25 @@ fi
 
 echo "Starting system setup..."
 
+# Configure APT sources list
+echo "Configuring APT sources list..."
+
+# Backup current sources.list
+cp /etc/apt/sources.list /etc/apt/sources.list.bak
+
+# Overwrite sources.list with only the required repositories
+sudo tee /etc/apt/sources.list > /dev/null <<EOF
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+EOF
+
+# Comment out any other repositories in sources.list.d
+if [ -d "/etc/apt/sources.list.d" ]; then
+    echo "Disabling additional repositories in /etc/apt/sources.list.d/..."
+    sudo find /etc/apt/sources.list.d/ -type f -name "*.list" -exec sed -i 's/^deb/#deb/g' {} +
+fi
+
 # Update and Upgrade System
 echo "Updating and upgrading system..."
 apt update && apt upgrade -y
